@@ -25,7 +25,8 @@
   #define PWM_MAX_CHANNELS 8
 #endif
 #define PWM_DEBUG 0
-#define PWM_USE_NMI 0
+#define PWM_USE_NMI 1
+#define PWM_SMOOTHLED 1
 
 /* no user servicable parts beyond this point */
 
@@ -46,6 +47,11 @@
 #include <pwm.h>
 #include <eagle_soc.h>
 #include <ets_sys.h>
+
+static bool PWM_AllowOutput=true; // set to 0 to force all output off
+
+static uint16_t PWM_DisabledOutput_on_mask;  ///< GPIO on mask to switch all outputs off
+static uint16_t PWM_DisabledOutput_off_mask; ///< GPIO off mask to switch all outputs off
 
 // from SDK hw_timer.c
 #define TIMER1_DIVIDE_BY_16             0x0004
@@ -109,9 +115,9 @@ struct timer_regs {
 };
 static struct timer_regs* timer = (struct timer_regs*)(0x60000600);
 
-static void ICACHE_RAM_ATTR
-pwm_intr_handler(void)
+static void pwm_intr_handler(void)
 {
+#if PWM_SMOOTHLED
 	if ((pwm_state.current_set[pwm_state.current_phase].off_mask == 0) &&
 	    (pwm_state.current_set[pwm_state.current_phase].on_mask == 0)) {
 		pwm_state.current_set = pwm_state.next_set;
@@ -122,8 +128,69 @@ pwm_intr_handler(void)
 		// force write to GPIO registers on each loop
 		asm volatile ("" : : : "memory");
 
-		gpio->out_w1ts = (uint32_t)(pwm_state.current_set[pwm_state.current_phase].on_mask);
-		gpio->out_w1tc = (uint32_t)(pwm_state.current_set[pwm_state.current_phase].off_mask);
+    if (PWM_AllowOutput) {
+      // allow normal PWM output
+      gpio->out_w1ts = (uint32_t)(pwm_state.current_set[pwm_state.current_phase].on_mask);
+      gpio->out_w1tc = (uint32_t)(pwm_state.current_set[pwm_state.current_phase].off_mask);
+    }
+    else {
+      // force all outputs disabled
+      gpio->out_w1ts = (uint32_t)(PWM_DisabledOutput_on_mask);
+      gpio->out_w1tc = (uint32_t)(PWM_DisabledOutput_off_mask);
+    }
+    
+		uint32_t ticks = pwm_state.current_set[pwm_state.current_phase].ticks;
+
+		pwm_state.current_phase++;
+
+		if (ticks) {
+//	16 is to short		if (ticks >= 16) {
+			if (ticks >= 30) {
+				// constant interrupt overhead
+				ticks -= 9;
+				timer->frc1_int &= ~FRC1_INT_CLR_MASK;
+				WRITE_PERI_REG(&timer->frc1_load, ticks);
+				return;
+			}
+
+			ticks *= 4;
+			do {
+				ticks -= 1;
+				// stop compiler from optimizing delay loop to noop
+				asm volatile ("" : : : "memory");
+			} while (ticks > 0);
+
+			if ((pwm_state.current_set[pwm_state.current_phase].off_mask == 0) &&
+			    (pwm_state.current_set[pwm_state.current_phase].on_mask == 0)) {
+				pwm_state.current_set = pwm_state.next_set;
+				pwm_state.current_phase = 0;
+			}
+		}
+
+	} while (1);
+
+#else
+
+	if ((pwm_state.current_set[pwm_state.current_phase].off_mask == 0) &&
+	    (pwm_state.current_set[pwm_state.current_phase].on_mask == 0)) {
+		pwm_state.current_set = pwm_state.next_set;
+		pwm_state.current_phase = 0;
+	}
+
+	do {
+		// force write to GPIO registers on each loop
+		asm volatile ("" : : : "memory");
+
+    if (PWM_AllowOutput) {
+      // allow normal PWM output
+      gpio->out_w1ts = (uint32_t)(pwm_state.current_set[pwm_state.current_phase].on_mask);
+      gpio->out_w1tc = (uint32_t)(pwm_state.current_set[pwm_state.current_phase].off_mask);
+    }
+    else {
+      // force all outputs disabled
+      gpio->out_w1ts = (uint32_t)(PWM_DisabledOutput_on_mask);
+      gpio->out_w1tc = (uint32_t)(PWM_DisabledOutput_off_mask);
+    }
 
 		uint32_t ticks = pwm_state.current_set[pwm_state.current_phase].ticks;
 
@@ -147,6 +214,7 @@ pwm_intr_handler(void)
 		}
 
 	} while (1);
+#endif
 }
 
 /**
@@ -188,6 +256,10 @@ pwm_init(uint32_t period, uint32_t *duty, uint32_t pwm_channel_num,
 	GPIO_REG_WRITE(GPIO_OUT_W1TC_ADDRESS, all);
 	GPIO_REG_WRITE(GPIO_ENABLE_W1TS_ADDRESS, all);
 
+  for (n = 0; n < pwm_channels; n++) {
+    PWM_DisabledOutput_off_mask |= gpio_mask[n];
+  }
+
 	pwm_set_period(period);
 
 #if PWM_USE_NMI
@@ -207,6 +279,104 @@ __attribute__ ((noinline))
 static uint8_t ICACHE_FLASH_ATTR
 _pwm_phases_prep(struct pwm_phase* pwm)
 {
+#if PWM_SMOOTHLED
+	uint8_t n, phases;
+
+	uint16_t off_mask = 0;
+	for (n = 0; n < pwm_channels + 2; n++) {
+		pwm[n].ticks = 0;
+		pwm[n].on_mask = 0;
+		pwm[n].off_mask = 0;
+	}
+	phases = 1;
+	for (n = 0; n < pwm_channels; n++) {
+		uint32_t ticks = PWM_DUTY_TO_TICKS(pwm_duty[n]);
+		if (ticks == 0) {
+			pwm[0].off_mask |= gpio_mask[n];
+		} else if (ticks >= pwm_period_ticks) {
+			pwm[0].on_mask |= gpio_mask[n];
+		} else {
+			// no longer invert phases
+			pwm[phases].ticks = ticks;
+			pwm[0].on_mask |= gpio_mask[n];
+			pwm[phases].off_mask = gpio_mask[n];
+			phases++;
+		}
+	}
+	pwm[phases].ticks = pwm_period_ticks;
+
+	// bubble sort, lowest to highest duty
+	n = 2;
+	while (n < phases) {
+		if (pwm[n].ticks < pwm[n - 1].ticks) {
+			struct pwm_phase t = pwm[n];
+			pwm[n] = pwm[n - 1];
+			pwm[n - 1] = t;
+			if (n > 2)
+				n--;
+		} else {
+			n++;
+		}
+	}
+
+#if PWM_DEBUG
+        int t = 0;
+	for (t = 0; t <= phases; t++) {
+		ets_printf("%d @%d:   %04x %04x\n", t, pwm[t].ticks, pwm[t].on_mask, pwm[t].off_mask);
+	}
+#endif
+
+	// no longer execute shift left to align right edge;
+
+	// merge same duty
+	uint8_t l = 0, r = 1;
+	l = 0, r = 1;
+	while (r <= phases) {
+		if (pwm[r].ticks == pwm[l].ticks) {
+			pwm[l].off_mask |= pwm[r].off_mask;
+			pwm[l].on_mask |= pwm[r].on_mask;
+			pwm[r].on_mask = 0;
+			pwm[r].off_mask = 0;
+		} else {
+			l++;
+			if (l != r) {
+				struct pwm_phase t = pwm[l];
+				pwm[l] = pwm[r];
+				pwm[r] = t;
+			}
+		}
+		r++;
+	}
+	phases = l;
+
+#if PWM_DEBUG
+	for (t = 0; t <= phases; t++) {
+		ets_printf("%d @%d:   %04x %04x\n", t, pwm[t].ticks, pwm[t].on_mask, pwm[t].off_mask);
+	}
+#endif
+
+	// transform absolute end time to phase durations
+	for (n = 0; n < phases; n++) {
+		pwm[n].ticks =
+			pwm[n + 1].ticks - pwm[n].ticks;
+		// subtract common overhead
+		pwm[n].ticks--;
+	}
+	pwm[phases].ticks = 0;
+
+	// no longer do a cyclic shift if last phase is short
+
+#if PWM_DEBUG
+	for (t = 0; t <= phases; t++) {
+		ets_printf("%d +%d:   %04x %04x\n", t, pwm[t].ticks, pwm[t].on_mask, pwm[t].off_mask);
+	}
+	ets_printf("\n");
+#endif
+
+	return phases;
+
+#else
+
 	uint8_t n, phases;
 
 	uint16_t off_mask = 0;
@@ -237,7 +407,7 @@ _pwm_phases_prep(struct pwm_phase* pwm)
 	}
 	pwm[phases].ticks = pwm_period_ticks;
 
-	// bubble sort, lowest to hightest duty
+	// bubble sort, lowest to highest duty
 	n = 2;
 	while (n < phases) {
 		if (pwm[n].ticks < pwm[n - 1].ticks) {
@@ -349,6 +519,7 @@ _pwm_phases_prep(struct pwm_phase* pwm)
 #endif
 
 	return phases;
+#endif
 }
 
 void ICACHE_FLASH_ATTR
@@ -447,3 +618,14 @@ set_pwm_debug_en(uint8_t print_en)
 	(void) print_en;
 }
 
+bool ICACHE_FLASH_ATTR
+get_pwm_PWM_AllowOutput(void)
+{
+  return PWM_AllowOutput;
+}
+
+void ICACHE_FLASH_ATTR
+set_pwm_PWM_AllowOutput(bool newVal)
+{
+  PWM_AllowOutput=newVal;
+}
